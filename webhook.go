@@ -18,8 +18,14 @@ func (webhookBackend) ConfigFields() []Field {
 }
 
 func (webhookBackend) Send(ctx context.Context, cfg map[string]string, msg Message) error {
-	body, _ := json.Marshal(map[string]interface{}{
+	payload := map[string]interface{}{
 		"job_id": msg.JobID, "job_name": msg.JobName, "event": msg.Event, "status": msg.Status,
-	})
+	}
+	// A workflow message adds "kind"; a job message omits it, so its body stays
+	// byte-for-byte the shape the pre-registry notifier sent.
+	if msg.Kind != "" {
+		payload["kind"] = msg.Kind
+	}
+	body, _ := json.Marshal(payload)
 	return postJSON(ctx, cfg["url"], body)
 }

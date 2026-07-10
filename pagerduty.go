@@ -30,7 +30,7 @@ func (pagerdutyBackend) Send(ctx context.Context, cfg map[string]string, msg Mes
 		"routing_key":  cfg["routing_key"],
 		"event_action": "trigger",
 		"payload": map[string]string{
-			"summary":  "Praetor job \"" + msg.JobName + "\" " + msg.Status,
+			"summary":  "Praetor " + msg.Subject() + " \"" + msg.JobName + "\" " + msg.Status,
 			"source":   "praetor",
 			"severity": cfg["severity"],
 		},

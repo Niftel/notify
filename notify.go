@@ -22,13 +22,46 @@ import (
 	"github.com/praetordev/praetor/pkg/registry"
 )
 
-// Message is the backend-agnostic notification content the consumer builds when
-// a job reaches a lifecycle event.
+// Message is the backend-agnostic notification content a producer builds when a
+// subject (a job, or a workflow run) reaches a lifecycle event. JobID/JobName are
+// the subject's id and display name — for a workflow they are the workflow_job id
+// and the workflow name (the field names are historical; Kind disambiguates).
 type Message struct {
 	JobID   int64  `json:"job_id"`
 	JobName string `json:"job_name"`
-	Event   string `json:"event"`  // started | success | error
-	Status  string `json:"status"` // human verb: started | succeeded | failed
+	Event   string `json:"event"`  // success | error | started | approval
+	Status  string `json:"status"` // human verb: succeeded | failed | needs approval
+	// Kind names the subject for human-facing backends ("workflow", "workflow
+	// approval"); empty means an ordinary job. It is omitempty so a job message's
+	// wire shape stays byte-identical to the pre-workflow notifier.
+	Kind string `json:"kind,omitempty"`
+}
+
+// Subject returns the human noun for the message's subject: Kind when set, else
+// "job". Used by the text backends so a job reads "Praetor job ..." unchanged and
+// a workflow reads "Praetor workflow ...".
+func (m Message) Subject() string {
+	if m.Kind != "" {
+		return m.Kind
+	}
+	return "job"
+}
+
+// SendOne resolves the backend for a stored (notificationType, config) and
+// delivers msg. It is the shared delivery primitive used by every producer (the
+// consumer for jobs, the scheduler for workflows) so backend lookup, config
+// decryption and Send live in exactly one place; callers own row iteration and
+// logging. Returns a descriptive error; never panics on an unknown type.
+func SendOne(ctx context.Context, notificationType string, config json.RawMessage, msg Message) error {
+	b, ok := Backends.Get(notificationType)
+	if !ok {
+		return fmt.Errorf("unknown notification backend %q", notificationType)
+	}
+	cfg, err := DecryptConfig(b, config)
+	if err != nil {
+		return fmt.Errorf("decrypt config for %s: %w", notificationType, err)
+	}
+	return b.Send(ctx, cfg, msg)
 }
 
 // Field describes one config input. Its shape mirrors credential_types.inputs
