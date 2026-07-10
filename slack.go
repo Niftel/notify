@@ -20,7 +20,7 @@ func (slackBackend) ConfigFields() []Field {
 
 func (slackBackend) Send(ctx context.Context, cfg map[string]string, msg Message) error {
 	body, _ := json.Marshal(map[string]string{
-		"text": fmt.Sprintf("Praetor job %q %s", msg.JobName, msg.Status),
+		"text": fmt.Sprintf("Praetor %s %q %s", msg.Subject(), msg.JobName, msg.Status),
 	})
 	return postJSON(ctx, cfg["url"], body)
 }
