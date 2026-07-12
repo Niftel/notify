@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/praetordev/praetor/pkg/crypto"
+	"github.com/praetordev/crypto"
 	"github.com/praetordev/registry"
 )
 
