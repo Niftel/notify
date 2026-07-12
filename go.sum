@@ -1,0 +1,4 @@
+github.com/praetordev/crypto v0.1.0 h1:7BMcnoSCPGILknroqhSFrQFjvJb6OnpoaEdFwL2VNvE=
+github.com/praetordev/crypto v0.1.0/go.mod h1:nZNnGjhYuouuHJor/JfWr9AWb/tatElVJb15aaPTkHM=
+github.com/praetordev/registry v0.1.0 h1:QXFEMLKtkqMmcKaKlKUc5KrOT/l+rm9qoSBju4bG3pQ=
+github.com/praetordev/registry v0.1.0/go.mod h1:8pC6g1iSZW6mU1OvSZ4eW1tsXZuvZSnO59hLtMAGUvo=
