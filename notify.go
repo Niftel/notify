@@ -19,7 +19,7 @@ import (
 	"net/http"
 
 	"github.com/praetordev/praetor/pkg/crypto"
-	"github.com/praetordev/praetor/pkg/registry"
+	"github.com/praetordev/registry"
 )
 
 // Message is the backend-agnostic notification content a producer builds when a
