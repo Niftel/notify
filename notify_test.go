@@ -6,13 +6,16 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
+	"strings"
+	"sync/atomic"
 	"testing"
 )
 
 // captureBody spins up a server that records the last request body, and points
 // the given field's value at it.
-func captureServer(t *testing.T) (url string, last *[]byte) {
+func captureServer(t *testing.T) (targetURL string, last *[]byte) {
 	t.Helper()
 	var body []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -20,6 +23,11 @@ func captureServer(t *testing.T) (url string, last *[]byte) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(srv.Close)
+	parsed, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PRAETOR_NOTIFICATION_ALLOWED_HOSTS", parsed.Hostname())
 	return srv.URL, &body
 }
 
@@ -124,5 +132,70 @@ func TestAllBackendsRegistered(t *testing.T) {
 	want := []string{"pagerduty", "slack", "webhook"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("registered backends = %v want %v", got, want)
+	}
+}
+
+func TestValidateDestinationRejectsUnsafeTargets(t *testing.T) {
+	t.Setenv("PRAETOR_NOTIFICATION_ALLOWED_HOSTS", "")
+	for _, raw := range []string{
+		"http://example.com/hook",
+		"file:///etc/passwd",
+		"https:///missing-host",
+		"https://user:secret@example.com/hook",
+		"https://127.0.0.1/hook",
+		"https://localhost/hook",
+		"https://169.254.169.254/latest/meta-data",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			if err := ValidateDestination(context.Background(), raw); err == nil {
+				t.Fatalf("ValidateDestination(%q) accepted an unsafe target", raw)
+			}
+		})
+	}
+}
+
+func TestAllowlistedDestinationMayUseHTTPAndPrivateAddress(t *testing.T) {
+	url, _ := captureServer(t)
+	if err := ValidateDestination(context.Background(), url); err != nil {
+		t.Fatalf("allowlisted destination rejected: %v", err)
+	}
+}
+
+func TestNotificationDeliveryDoesNotFollowRedirects(t *testing.T) {
+	var destinationCalls atomic.Int32
+	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		destinationCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(destination.Close)
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Redirect(w, &http.Request{}, destination.URL, http.StatusFound)
+	}))
+	t.Cleanup(redirect.Close)
+	redirectURL, _ := url.Parse(redirect.URL)
+	destinationURL, _ := url.Parse(destination.URL)
+	t.Setenv("PRAETOR_NOTIFICATION_ALLOWED_HOSTS", redirectURL.Hostname()+","+destinationURL.Hostname())
+
+	b, _ := Backends.Get("webhook")
+	err := b.Send(context.Background(), map[string]string{"url": redirect.URL}, Message{JobID: 9, JobName: "redirect"})
+	if err == nil || !strings.Contains(err.Error(), "returned 302") {
+		t.Fatalf("redirect delivery error = %v, want returned 302", err)
+	}
+	if got := destinationCalls.Load(); got != 0 {
+		t.Fatalf("redirect destination received %d request(s), want 0", got)
+	}
+}
+
+func TestNotificationDeliveryRejectsNonSuccessStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(server.Close)
+	parsed, _ := url.Parse(server.URL)
+	t.Setenv("PRAETOR_NOTIFICATION_ALLOWED_HOSTS", parsed.Hostname())
+	b, _ := Backends.Get("slack")
+	err := b.Send(context.Background(), map[string]string{"url": server.URL}, Message{JobName: "failure"})
+	if err == nil || !strings.Contains(err.Error(), "returned 502") {
+		t.Fatalf("delivery error = %v, want returned 502", err)
 	}
 }
