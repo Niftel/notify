@@ -16,7 +16,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"time"
 
 	"github.com/praetordev/crypto"
 	"github.com/praetordev/registry"
@@ -163,18 +168,128 @@ func DecryptConfig(b Backend, raw json.RawMessage) (map[string]string, error) {
 // postJSON POSTs body as application/json to url, honouring ctx. Shared by the
 // HTTP-shaped backends.
 func postJSON(ctx context.Context, url string, body []byte) error {
+	client, err := notificationHTTPClient(ctx, url)
+	if err != nil {
+		return err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req) // #nosec G704 -- destination and dial target are validated below.
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return fmt.Errorf("notification endpoint returned %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// ValidateDestination verifies an operator-supplied HTTP notification endpoint.
+// Public destinations require HTTPS. Private, loopback, link-local, and plain
+// HTTP destinations are accepted only when their exact hostname is present in
+// PRAETOR_NOTIFICATION_ALLOWED_HOSTS. The same validation runs again when the
+// transport dials, preventing a later DNS answer from widening the destination.
+func ValidateDestination(ctx context.Context, raw string) error {
+	_, _, err := validateDestination(ctx, raw)
+	return err
+}
+
+func validateDestination(ctx context.Context, raw string) (*url.URL, bool, error) {
+	destination, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return nil, false, fmt.Errorf("parse notification destination: %w", err)
+	}
+	if destination.Hostname() == "" {
+		return nil, false, fmt.Errorf("notification destination must include a host")
+	}
+	if destination.User != nil {
+		return nil, false, fmt.Errorf("notification destination must not include user information")
+	}
+	host := strings.ToLower(strings.TrimSuffix(destination.Hostname(), "."))
+	allowlisted := notificationAllowedHosts()[host]
+	if destination.Scheme != "https" && !(allowlisted && destination.Scheme == "http") {
+		return nil, false, fmt.Errorf("notification destination must use https unless its host is explicitly allowlisted")
+	}
+	if allowlisted {
+		return destination, true, nil
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	addresses, err := net.DefaultResolver.LookupIPAddr(lookupCtx, host)
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve notification destination: %w", err)
+	}
+	if len(addresses) == 0 {
+		return nil, false, fmt.Errorf("notification destination did not resolve")
+	}
+	for _, address := range addresses {
+		if !isPublicNotificationIP(address.IP) {
+			return nil, false, fmt.Errorf("notification destination resolves to a non-public address")
+		}
+	}
+	return destination, false, nil
+}
+
+func notificationAllowedHosts() map[string]bool {
+	allowed := make(map[string]bool)
+	for _, raw := range strings.Split(os.Getenv("PRAETOR_NOTIFICATION_ALLOWED_HOSTS"), ",") {
+		host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
+		if host != "" {
+			allowed[host] = true
+		}
+	}
+	return allowed
+}
+
+func isPublicNotificationIP(ip net.IP) bool {
+	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLoopback() &&
+		!ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast() && !ip.IsUnspecified()
+}
+
+func notificationHTTPClient(ctx context.Context, raw string) (*http.Client, error) {
+	destination, allowlisted, err := validateDestination(ctx, raw)
+	if err != nil {
+		return nil, err
+	}
+	destinationHost := strings.ToLower(strings.TrimSuffix(destination.Hostname(), "."))
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	transport := &http.Transport{
+		Proxy: nil,
+		DialContext: func(dialCtx context.Context, network, address string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, fmt.Errorf("parse notification dial address: %w", err)
+			}
+			host = strings.ToLower(strings.TrimSuffix(host, "."))
+			if host != destinationHost {
+				return nil, fmt.Errorf("notification dial host does not match the validated destination")
+			}
+			if allowlisted {
+				return dialer.DialContext(dialCtx, network, net.JoinHostPort(host, port))
+			}
+			addresses, err := net.DefaultResolver.LookupIPAddr(dialCtx, host)
+			if err != nil {
+				return nil, fmt.Errorf("resolve notification dial target: %w", err)
+			}
+			for _, candidate := range addresses {
+				if !isPublicNotificationIP(candidate.IP) {
+					return nil, fmt.Errorf("notification dial target resolved to a non-public address")
+				}
+			}
+			if len(addresses) == 0 {
+				return nil, fmt.Errorf("notification dial target did not resolve")
+			}
+			return dialer.DialContext(dialCtx, network, net.JoinHostPort(addresses[0].IP.String(), port))
+		},
+	}
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}, nil
 }
