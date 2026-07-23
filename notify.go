@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -26,6 +27,48 @@ import (
 	"github.com/praetordev/crypto"
 	"github.com/praetordev/registry"
 )
+
+// FailureCode is a stable, redaction-safe delivery failure category. Callers
+// may persist these values and use Retryable to decide whether to reschedule a
+// logical delivery; they must not parse Error() text.
+type FailureCode string
+
+const (
+	FailureUnknownBackend         FailureCode = "unknown_backend"
+	FailureInvalidConfiguration   FailureCode = "invalid_configuration"
+	FailureUnsafeDestination      FailureCode = "unsafe_destination"
+	FailureRequestTimeout         FailureCode = "request_timeout"
+	FailureConnection             FailureCode = "connection_failure"
+	FailureRateLimited            FailureCode = "rate_limited"
+	FailureDestinationUnavailable FailureCode = "destination_unavailable"
+	FailureDestinationRejected    FailureCode = "destination_rejected"
+)
+
+// DeliveryError is safe to log or persist. Its message is deliberately
+// controlled by this package and never contains destination URLs, credentials,
+// headers, response bodies, or wrapped transport error text.
+type DeliveryError struct {
+	Code      FailureCode
+	Retryable bool
+	message   string
+}
+
+func (e *DeliveryError) Error() string {
+	if e == nil {
+		return "notification delivery failed"
+	}
+	return e.message
+}
+
+func deliveryError(code FailureCode, retryable bool, message string) error {
+	return &DeliveryError{Code: code, Retryable: retryable, message: message}
+}
+
+// Failure returns the typed delivery failure carried by err.
+func Failure(err error) (*DeliveryError, bool) {
+	var failure *DeliveryError
+	return failure, errors.As(err, &failure)
+}
 
 // Message is the backend-agnostic notification content a producer builds when a
 // subject (a job, or a workflow run) reaches a lifecycle event. JobID/JobName are
@@ -60,11 +103,16 @@ func (m Message) Subject() string {
 func SendOne(ctx context.Context, notificationType string, config json.RawMessage, msg Message) error {
 	b, ok := Backends.Get(notificationType)
 	if !ok {
-		return fmt.Errorf("unknown notification backend %q", notificationType)
+		return deliveryError(FailureUnknownBackend, false, "notification backend is not supported")
 	}
 	cfg, err := DecryptConfig(b, config)
 	if err != nil {
-		return fmt.Errorf("decrypt config for %s: %w", notificationType, err)
+		return deliveryError(FailureInvalidConfiguration, false, "notification configuration is invalid")
+	}
+	for _, field := range b.ConfigFields() {
+		if field.Default == "" && strings.TrimSpace(cfg[field.ID]) == "" {
+			return deliveryError(FailureInvalidConfiguration, false, "notification configuration is incomplete")
+		}
 	}
 	return b.Send(ctx, cfg, msg)
 }
@@ -174,16 +222,35 @@ func postJSON(ctx context.Context, url string, body []byte) error {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return deliveryError(FailureInvalidConfiguration, false, "notification request configuration is invalid")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req) // #nosec G704 -- destination and dial target are validated below.
 	if err != nil {
-		return err
+		if failure, ok := Failure(err); ok {
+			return failure
+		}
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return deliveryError(FailureRequestTimeout, true, "notification request timed out")
+		}
+		var netError net.Error
+		if errors.As(err, &netError) && netError.Timeout() {
+			return deliveryError(FailureRequestTimeout, true, "notification request timed out")
+		}
+		return deliveryError(FailureConnection, true, "notification destination could not be reached")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("notification endpoint returned %d", resp.StatusCode)
+		switch {
+		case resp.StatusCode == http.StatusRequestTimeout:
+			return deliveryError(FailureRequestTimeout, true, "notification destination timed out")
+		case resp.StatusCode == http.StatusTooManyRequests:
+			return deliveryError(FailureRateLimited, true, "notification destination rate limited the request")
+		case resp.StatusCode >= http.StatusInternalServerError:
+			return deliveryError(FailureDestinationUnavailable, true, "notification destination is unavailable")
+		default:
+			return deliveryError(FailureDestinationRejected, false, "notification destination rejected the request")
+		}
 	}
 	return nil
 }
@@ -201,18 +268,18 @@ func ValidateDestination(ctx context.Context, raw string) error {
 func validateDestination(ctx context.Context, raw string) (*url.URL, bool, error) {
 	destination, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
-		return nil, false, fmt.Errorf("parse notification destination: %w", err)
+		return nil, false, deliveryError(FailureUnsafeDestination, false, "notification destination is invalid")
 	}
 	if destination.Hostname() == "" {
-		return nil, false, fmt.Errorf("notification destination must include a host")
+		return nil, false, deliveryError(FailureUnsafeDestination, false, "notification destination must include a host")
 	}
 	if destination.User != nil {
-		return nil, false, fmt.Errorf("notification destination must not include user information")
+		return nil, false, deliveryError(FailureUnsafeDestination, false, "notification destination must not include user information")
 	}
 	host := strings.ToLower(strings.TrimSuffix(destination.Hostname(), "."))
 	allowlisted := notificationAllowedHosts()[host]
 	if destination.Scheme != "https" && !(allowlisted && destination.Scheme == "http") {
-		return nil, false, fmt.Errorf("notification destination must use https unless its host is explicitly allowlisted")
+		return nil, false, deliveryError(FailureUnsafeDestination, false, "notification destination does not use an allowed scheme")
 	}
 	if allowlisted {
 		return destination, true, nil
@@ -221,14 +288,14 @@ func validateDestination(ctx context.Context, raw string) (*url.URL, bool, error
 	defer cancel()
 	addresses, err := net.DefaultResolver.LookupIPAddr(lookupCtx, host)
 	if err != nil {
-		return nil, false, fmt.Errorf("resolve notification destination: %w", err)
+		return nil, false, deliveryError(FailureConnection, true, "notification destination could not be resolved")
 	}
 	if len(addresses) == 0 {
-		return nil, false, fmt.Errorf("notification destination did not resolve")
+		return nil, false, deliveryError(FailureConnection, true, "notification destination could not be resolved")
 	}
 	for _, address := range addresses {
 		if !isPublicNotificationIP(address.IP) {
-			return nil, false, fmt.Errorf("notification destination resolves to a non-public address")
+			return nil, false, deliveryError(FailureUnsafeDestination, false, "notification destination resolves to a non-public address")
 		}
 	}
 	return destination, false, nil
@@ -262,26 +329,26 @@ func notificationHTTPClient(ctx context.Context, raw string) (*http.Client, erro
 		DialContext: func(dialCtx context.Context, network, address string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(address)
 			if err != nil {
-				return nil, fmt.Errorf("parse notification dial address: %w", err)
+				return nil, deliveryError(FailureConnection, true, "notification destination could not be reached")
 			}
 			host = strings.ToLower(strings.TrimSuffix(host, "."))
 			if host != destinationHost {
-				return nil, fmt.Errorf("notification dial host does not match the validated destination")
+				return nil, deliveryError(FailureUnsafeDestination, false, "notification dial target does not match the validated destination")
 			}
 			if allowlisted {
 				return dialer.DialContext(dialCtx, network, net.JoinHostPort(host, port))
 			}
 			addresses, err := net.DefaultResolver.LookupIPAddr(dialCtx, host)
 			if err != nil {
-				return nil, fmt.Errorf("resolve notification dial target: %w", err)
+				return nil, deliveryError(FailureConnection, true, "notification destination could not be resolved")
 			}
 			for _, candidate := range addresses {
 				if !isPublicNotificationIP(candidate.IP) {
-					return nil, fmt.Errorf("notification dial target resolved to a non-public address")
+					return nil, deliveryError(FailureUnsafeDestination, false, "notification dial target resolved to a non-public address")
 				}
 			}
 			if len(addresses) == 0 {
-				return nil, fmt.Errorf("notification dial target did not resolve")
+				return nil, deliveryError(FailureConnection, true, "notification destination could not be resolved")
 			}
 			return dialer.DialContext(dialCtx, network, net.JoinHostPort(addresses[0].IP.String(), port))
 		},

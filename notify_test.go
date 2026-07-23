@@ -11,7 +11,27 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
+
+func requireFailure(t *testing.T, err error, code FailureCode, retryable bool) *DeliveryError {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("delivery error = nil, want %s", code)
+	}
+	failure, ok := Failure(err)
+	if !ok {
+		t.Fatalf("delivery error type = %T, want *DeliveryError", err)
+	}
+	if failure.Code != code || failure.Retryable != retryable {
+		t.Fatalf("delivery failure = (%s, retryable=%t), want (%s, retryable=%t)",
+			failure.Code, failure.Retryable, code, retryable)
+	}
+	if len(failure.Error()) == 0 || len(failure.Error()) > 160 {
+		t.Fatalf("delivery failure message length = %d, want 1..160", len(failure.Error()))
+	}
+	return failure
+}
 
 // captureBody spins up a server that records the last request body, and points
 // the given field's value at it.
@@ -178,9 +198,7 @@ func TestNotificationDeliveryDoesNotFollowRedirects(t *testing.T) {
 
 	b, _ := Backends.Get("webhook")
 	err := b.Send(context.Background(), map[string]string{"url": redirect.URL}, Message{JobID: 9, JobName: "redirect"})
-	if err == nil || !strings.Contains(err.Error(), "returned 302") {
-		t.Fatalf("redirect delivery error = %v, want returned 302", err)
-	}
+	requireFailure(t, err, FailureDestinationRejected, false)
 	if got := destinationCalls.Load(); got != 0 {
 		t.Fatalf("redirect destination received %d request(s), want 0", got)
 	}
@@ -195,7 +213,91 @@ func TestNotificationDeliveryRejectsNonSuccessStatus(t *testing.T) {
 	t.Setenv("PRAETOR_NOTIFICATION_ALLOWED_HOSTS", parsed.Hostname())
 	b, _ := Backends.Get("slack")
 	err := b.Send(context.Background(), map[string]string{"url": server.URL}, Message{JobName: "failure"})
-	if err == nil || !strings.Contains(err.Error(), "returned 502") {
-		t.Fatalf("delivery error = %v, want returned 502", err)
+	requireFailure(t, err, FailureDestinationUnavailable, true)
+}
+
+func TestDeliveryFailureContract(t *testing.T) {
+	t.Run("unknown backend", func(t *testing.T) {
+		err := SendOne(context.Background(), "secret-backend-name", json.RawMessage(`{}`), Message{})
+		failure := requireFailure(t, err, FailureUnknownBackend, false)
+		if strings.Contains(failure.Error(), "secret-backend-name") {
+			t.Fatal("unknown backend error exposed the configured backend value")
+		}
+	})
+
+	t.Run("invalid stored configuration", func(t *testing.T) {
+		err := SendOne(context.Background(), "webhook", json.RawMessage(`{"url":`), Message{})
+		requireFailure(t, err, FailureInvalidConfiguration, false)
+	})
+
+	t.Run("missing required configuration", func(t *testing.T) {
+		err := SendOne(context.Background(), "webhook", json.RawMessage(`{}`), Message{})
+		requireFailure(t, err, FailureInvalidConfiguration, false)
+	})
+
+	t.Run("unsafe destination", func(t *testing.T) {
+		const secret = "credential-that-must-not-leak"
+		err := ValidateDestination(context.Background(), "https://user:"+secret+"@example.com/private/path")
+		failure := requireFailure(t, err, FailureUnsafeDestination, false)
+		if strings.Contains(failure.Error(), secret) || strings.Contains(failure.Error(), "private/path") {
+			t.Fatal("unsafe destination error exposed URL material")
+		}
+	})
+
+	t.Run("request timeout", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			time.Sleep(100 * time.Millisecond)
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(server.Close)
+		parsed, _ := url.Parse(server.URL)
+		t.Setenv("PRAETOR_NOTIFICATION_ALLOWED_HOSTS", parsed.Hostname())
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		err := postJSON(ctx, server.URL, []byte(`{}`))
+		requireFailure(t, err, FailureRequestTimeout, true)
+	})
+
+	t.Run("connection failure", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		raw := server.URL
+		parsed, _ := url.Parse(raw)
+		server.Close()
+		t.Setenv("PRAETOR_NOTIFICATION_ALLOWED_HOSTS", parsed.Hostname())
+		err := postJSON(context.Background(), raw, []byte(`{}`))
+		failure := requireFailure(t, err, FailureConnection, true)
+		if strings.Contains(failure.Error(), raw) {
+			t.Fatal("connection error exposed the destination URL")
+		}
+	})
+
+	for _, test := range []struct {
+		name      string
+		status    int
+		code      FailureCode
+		retryable bool
+	}{
+		{name: "408 timeout", status: http.StatusRequestTimeout, code: FailureRequestTimeout, retryable: true},
+		{name: "429 rate limited", status: http.StatusTooManyRequests, code: FailureRateLimited, retryable: true},
+		{name: "500 unavailable", status: http.StatusInternalServerError, code: FailureDestinationUnavailable, retryable: true},
+		{name: "503 unavailable", status: http.StatusServiceUnavailable, code: FailureDestinationUnavailable, retryable: true},
+		{name: "400 rejected", status: http.StatusBadRequest, code: FailureDestinationRejected, retryable: false},
+		{name: "401 rejected", status: http.StatusUnauthorized, code: FailureDestinationRejected, retryable: false},
+		{name: "404 rejected", status: http.StatusNotFound, code: FailureDestinationRejected, retryable: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const responseSecret = "response-body-secret"
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(test.status)
+				_, _ = w.Write([]byte(responseSecret))
+			}))
+			t.Cleanup(server.Close)
+			parsed, _ := url.Parse(server.URL)
+			t.Setenv("PRAETOR_NOTIFICATION_ALLOWED_HOSTS", parsed.Hostname())
+			failure := requireFailure(t, postJSON(context.Background(), server.URL, []byte(`{}`)), test.code, test.retryable)
+			if strings.Contains(failure.Error(), responseSecret) || strings.Contains(failure.Error(), server.URL) {
+				t.Fatal("HTTP delivery error exposed response or destination material")
+			}
+		})
 	}
 }
